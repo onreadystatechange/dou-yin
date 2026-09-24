@@ -52,10 +52,25 @@ def main() -> None:
 
         fetch.list_posts(limit=args.limit, full=args.full)
         transcribe.run()  # 先处理已下载但未转写的
+        failed: set[str] = set()
+        refreshed = True
         while fetch.pending_count():
-            print(f"剩余待下载 {fetch.pending_count()} 条")
-            fetch.download(limit=config.BATCH_SIZE)
-            transcribe.run()
+            print(f"剩余待下载 {fetch.pending_count()} 条（本轮失败 {len(failed)} 条）")
+            ok, bad = 0, set()
+            if fetch.pending_count() > len(failed):
+                ok, bad = fetch.download(limit=config.BATCH_SIZE, skip=frozenset(failed))
+            failed |= bad
+            if ok:
+                refreshed = False
+                transcribe.run()
+            elif refreshed:
+                print("刷新播放地址后仍全部下载失败，停止")
+                break
+            else:
+                print("整批下载失败，多半是播放地址过期，重拉作品列表刷新地址")
+                fetch.list_posts(full=True)
+                failed.clear()
+                refreshed = True
     if args.cmd in ("extract", "all"):
         import extract
 

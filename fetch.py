@@ -77,12 +77,15 @@ def _parse_aweme(aweme: dict) -> Optional[dict]:
 
 
 def _save_items(items: list[dict]) -> None:
+    """播放地址几小时就过期，未下载的作品每次列表翻到都更新地址。"""
     with db.connect() as conn:
         for it in items:
             conn.execute(
-                """INSERT OR IGNORE INTO videos
+                """INSERT INTO videos
                    (aweme_id, author, title, create_time, share_url, duration_sec, play_url)
-                   VALUES (:aweme_id, :author, :title, :create_time, :share_url, :duration_sec, :play_url)""",
+                   VALUES (:aweme_id, :author, :title, :create_time, :share_url, :duration_sec, :play_url)
+                   ON CONFLICT(aweme_id) DO UPDATE SET play_url = excluded.play_url
+                   WHERE videos.video_path IS NULL""",
                 it,
             )
 
@@ -129,6 +132,7 @@ async def _list_posts(user_url: str, limit: Optional[int], full: bool) -> int:
     sec_user_id = m.group(1) if m else await SecUserIdFetcher.get_sec_user_id(user_url)
     with db.connect() as conn:
         known = {r[0] for r in conn.execute("SELECT aweme_id FROM videos")}
+        undownloaded = {r[0] for r in conn.execute("SELECT aweme_id FROM videos WHERE video_path IS NULL")}
 
     added = 0
     max_cursor = _load_cursor() if full else 0
@@ -147,12 +151,16 @@ async def _list_posts(user_url: str, limit: Optional[int], full: bool) -> int:
 
         hit_known = False
         items = []
+        refresh = []
         for aweme in aweme_list:
             # 置顶作品可能比后续作品旧，不能据此判断增量截止
             is_top = bool(aweme.get("is_top"))
-            if str(aweme.get("aweme_id")) in known:
+            aweme_id = str(aweme.get("aweme_id"))
+            if aweme_id in known:
                 if not is_top:
                     hit_known = True
+                if aweme_id in undownloaded and (parsed := _parse_aweme(aweme)):
+                    refresh.append(parsed)
                 continue
             parsed = _parse_aweme(aweme)
             if parsed:
@@ -160,7 +168,7 @@ async def _list_posts(user_url: str, limit: Optional[int], full: bool) -> int:
                 known.add(parsed["aweme_id"])
         if limit:
             items = items[: max(limit - added, 0)]
-        _save_items(items)
+        _save_items(items + refresh)
         added += len(items)
 
         last = aweme_list[-1]["create_time"] if aweme_list else None
@@ -174,15 +182,6 @@ async def _list_posts(user_url: str, limit: Optional[int], full: bool) -> int:
         if full:
             _save_cursor(max_cursor)
         await asyncio.sleep(random.uniform(4, 8))
-
-
-async def _refresh_play_url(aweme_id: str) -> Optional[str]:
-    """播放地址有时效，过期后通过作品详情接口重新获取。"""
-    async with DouyinCrawler(_crawler_kwargs()) as crawler:
-        resp = await crawler.fetch_post_detail(PostDetail(aweme_id=aweme_id))
-    detail = resp.get("aweme_detail")
-    parsed = _parse_aweme(detail) if detail else None
-    return parsed["play_url"] if parsed else None
 
 
 def _download(url: str, path: str) -> None:
@@ -238,31 +237,31 @@ def run(limit: Optional[int] = None, full: bool = False, urls: Optional[list[str
     download(limit)
 
 
-def download(limit: Optional[int] = None) -> None:
-    """下载尚未下载的视频，按发布时间倒序。刷新地址后仍失败的清空 play_url，避免批处理反复卡在同一条上。"""
+def download(limit: Optional[int] = None, skip: frozenset = frozenset()) -> tuple[int, set[str]]:
+    """下载尚未下载的视频，按发布时间倒序，跳过 skip 中本轮已失败的。返回（成功数, 失败的 aweme_id）。
+    地址过期导致的失败不逐条调详情接口刷新（请求密集会被 403），由调用方重拉列表统一刷新。"""
     os.makedirs(config.VIDEO_DIR, exist_ok=True)
     with db.connect() as conn:
-        pending = conn.execute(
-            "SELECT aweme_id, play_url FROM videos WHERE video_path IS NULL AND play_url IS NOT NULL "
-            "ORDER BY create_time DESC"
-        ).fetchall()
+        pending = [
+            r for r in conn.execute(
+                "SELECT aweme_id, play_url FROM videos WHERE video_path IS NULL AND play_url IS NOT NULL "
+                "ORDER BY create_time DESC"
+            ).fetchall()
+            if r["aweme_id"] not in skip
+        ]
     if limit:
         pending = pending[:limit]
+    ok, failed = 0, set()
     for row in pending:
         path = os.path.join(config.VIDEO_DIR, f"{row['aweme_id']}.mp4")
         try:
             _download(row["play_url"], path)
-        except Exception:  # noqa: BLE001
-            try:
-                url = asyncio.run(_refresh_play_url(row["aweme_id"]))
-                if not url:
-                    raise RuntimeError("作品详情中没有播放地址")
-                _download(url, path)
-            except Exception as e:  # noqa: BLE001
-                print(f"  下载失败 {row['aweme_id']}: {e}")
-                with db.connect() as conn:
-                    conn.execute("UPDATE videos SET play_url=NULL WHERE aweme_id=?", (row["aweme_id"],))
-                continue
+        except Exception as e:  # noqa: BLE001
+            print(f"  下载失败 {row['aweme_id']}: {e}")
+            failed.add(row["aweme_id"])
+            continue
         with db.connect() as conn:
             conn.execute("UPDATE videos SET video_path=? WHERE aweme_id=?", (path, row["aweme_id"]))
+        ok += 1
         print(f"  已下载 {row['aweme_id']}")
+    return ok, failed
