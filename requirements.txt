@@ -1,0 +1,13 @@
+f2>=0.0.1.7
+click==8.1.7
+imageio-ffmpeg>=0.5.0
+funasr>=1.1.0
+modelscope>=1.15.0
+torch>=2.2.0
+torchaudio>=2.2.0
+openai>=1.30.0
+akshare>=1.12.0
+pandas>=1.5.0
+tqdm>=4.65.0
+requests>=2.28.0
+python-dotenv>=1.0.0
